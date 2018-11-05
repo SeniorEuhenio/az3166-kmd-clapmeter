@@ -6,19 +6,50 @@
 #include "DevKitMQTTClient.h"
 #include "mbed.h"
 #include "Arduino.h"
+#include "AudioClassV2.h"
 
 #include "config.h"
 #include "utility.h"
 #include "SystemTickCounter.h"
 
+
 static bool hasWifi = false;
 int messageCount = 1;
 static bool messageSending = true;
-static uint64_t send_interval_ms;
+static uint64_t tick;
+int lastButtonAState;
+int buttonAState;
+int lastButtonBState;
+int buttonBState;
 
+#define UPLOAD_INTERVAL 1000
+#define SAMPLE_RATE 8000 // 8khz
+#define WAVE_HEADER_LEN 45
+#define BITS_PER_SAMPLE 16
+#define BYTES_PER_SAMPLE BITS_PER_SAMPLE / 8
+#define AUDIO_LEN_SECS 1
+const int AUDIO_LEN_MSECS = AUDIO_LEN_SECS * 1000;
+const int AUDIO_SIZE = AUDIO_LEN_SECS * (SAMPLE_RATE * BYTES_PER_SAMPLE) + WAVE_HEADER_LEN; // one sec more
+
+typedef enum {
+  CLAPMODE_NOP = 0,
+  CLAPMODE_SAMPLING,
+  CLAPMODE_CALCING,
+  CLAPMODE_UPLOADING
+} CLAPMODE_TYPEDEF;
+
+AudioClass& Audio = AudioClass::getInstance();
+char *audioBuffer;
+int audioInBuffer = 0;
+int clapState = CLAPMODE_NOP;
+
+char idler[] = { '|', '/', '-', '\\', '-'};
+byte idlerCounter = 0;
+
+float maxLevel = -22.0;
 
 #define DEVICE_NAME "CLAP_0x"
-char clapDeviceId[50];
+char clapDeviceId[16];
 
 //////////////////////////////////////////////////////////////////////////////////////////////////////////
 // Utilities
@@ -96,6 +127,37 @@ static int  DeviceMethodCallback(const char *methodName, const unsigned char *pa
   return result;
 }
 
+
+void setState(int newState){
+  if (newState != clapState) {
+    clapState = newState;
+    char buf[16];
+
+    switch (clapState) {
+      case CLAPMODE_NOP:
+        snprintf(buf, 16, "%c Idling...", idler[idlerCounter++ % 5]);
+        ledOff();
+        break;
+      case CLAPMODE_SAMPLING:
+        ledOn(RGB_LED_BRIGHTNESS, 0, 0);
+        snprintf(buf, 16, "> Sampling...");
+        break;        
+      case CLAPMODE_CALCING:
+        ledOn(RGB_LED_BRIGHTNESS, 0, RGB_LED_BRIGHTNESS);
+        snprintf(buf, 16, "> Calculating");
+        break;
+      case CLAPMODE_UPLOADING:
+        ledOn(0, 0, RGB_LED_BRIGHTNESS);
+        snprintf(buf, 16, "> Uploading...");
+        break;
+      default:
+        ledOn(RGB_LED_BRIGHTNESS, RGB_LED_BRIGHTNESS, 0);
+        snprintf(buf, 16, "X-(");
+        break;
+    }
+    Screen.print(3, buf);
+  }
+}
 //////////////////////////////////////////////////////////////////////////////////////////////////////////
 // Arduino sketch
 void setup()
@@ -122,63 +184,136 @@ void setup()
   SensorInit();
 
   Screen.print(3, " > IoT Hub");
-  DevKitMQTTClient_SetOption(OPTION_MINI_SOLUTION_NAME, "DevKit-GetStarted");
-  DevKitMQTTClient_Init(true, false);
+  DevKitMQTTClient_SetOption(OPTION_MINI_SOLUTION_NAME, "DevKit-KmdClapMeter");
+  DevKitMQTTClient_Init(true, true);
 
   DevKitMQTTClient_SetSendConfirmationCallback(SendConfirmationCallback);
   DevKitMQTTClient_SetMessageCallback(MessageCallback);
   DevKitMQTTClient_SetDeviceTwinCallback(DeviceTwinCallback);
   DevKitMQTTClient_SetDeviceMethodCallback(DeviceMethodCallback);
 
-  send_interval_ms = SystemTickCounterRead();
-
   snprintf(clapDeviceId, 50, "%s%lx", DEVICE_NAME, random());
 
-  Screen.print(2, clapDeviceId);
+  Screen.print(1, clapDeviceId);
+
+  // Setup your local audio buffer
+  audioBuffer = (char *)malloc(AUDIO_SIZE + 1);
+
+  // initialize the button pin as a input
+  pinMode(USER_BUTTON_A, INPUT);
+  lastButtonAState = digitalRead(USER_BUTTON_A);
+  pinMode(USER_BUTTON_B, INPUT);
+  lastButtonBState = digitalRead(USER_BUTTON_B);
+
+  tick = millis();
+}
+
+int record()
+{
+  memset(audioBuffer, 0x0, AUDIO_SIZE);
+
+  // Re-config the audio data format
+  Audio.format(SAMPLE_RATE, BITS_PER_SAMPLE);
+
+  // Start to record audio data
+  int status = Audio.startRecord(audioBuffer, AUDIO_SIZE);
+  if (status != AUDIO_STATE_IDLE) {
+    Serial.println("RecStartStatus="+ String(status));
+  }
+
+  uint32_t started = millis();
+  // Check whether the audio record is completed.
+  while (millis() - started < AUDIO_LEN_SECS * 1000)
+  {
+    status = Audio.getAudioState();
+    
+    if (status != AUDIO_STATE_RECORDING) {
+      if (status != AUDIO_STATE_RECORDING_FINISH) {
+        Serial.println("WhileRecStartStatus="+ String(status));
+      }
+      break;
+    }
+    delay(10);
+  }
+  Audio.stop();
+
+  return Audio.getCurrentSize();
+}
+
+void resetLevel() {
+  maxLevel = -22.0;
 }
 
 void loop()
 {
+  buttonAState = digitalRead(USER_BUTTON_A);
+  buttonBState = digitalRead(USER_BUTTON_B);
+
+  if (buttonAState == LOW && lastButtonAState == HIGH
+    && buttonBState == LOW && lastButtonBState == HIGH) {
+      resetLevel();
+  }
+
+  setState(CLAPMODE_SAMPLING);
+  audioInBuffer = record();
+  setState(CLAPMODE_NOP);
+
   if (hasWifi)
   {
-    if (messageSending && 
-        (int)(SystemTickCounterRead() - send_interval_ms) >= getInterval())
+    if (audioInBuffer) 
     {
-      // Send teperature data
-      char messagePayload[MESSAGE_MAX_LEN];
+        setState(CLAPMODE_CALCING);
 
-      //bool temperatureAlert = readMessage(messageCount++, messagePayload);
-      EVENT_INSTANCE* message = DevKitMQTTClient_Event_Generate(messagePayload, MESSAGE);
-      //DevKitMQTTClient_Event_AddProp(message, "temperatureAlert", temperatureAlert ? "true" : "false");
+        const byte BUF_LEN = 50;
+        char buf[BUF_LEN];
 
-      const byte BUF_LEN = 128;
-      char buf[BUF_LEN];
+        float curLevel = -23.0;
+        curLevel = calcLoudness16LE(audioBuffer, audioInBuffer);
+        audioInBuffer = 0;
 
-      DevKitMQTTClient_Event_AddProp(message, "DID", clapDeviceId);
+        maxLevel = max(curLevel, maxLevel);
+        snprintf(buf, BUF_LEN, "dB=%.2f/%.2f", curLevel, maxLevel);
+        Screen.print(2, buf);
 
-      DevKitMQTTClient_Event_AddProp(message, "SV", "42");
+      if (messageSending)
+      {
+        char messagePayload[MESSAGE_MAX_LEN];
 
-      snprintf(buf, BUF_LEN, "%.2f", readTemperature());   
-      DevKitMQTTClient_Event_AddProp(message, "TV", buf);
+        EVENT_INSTANCE* message = DevKitMQTTClient_Event_Generate(messagePayload, MESSAGE);
 
-      snprintf(buf, BUF_LEN, "%.2f", readHumidity());
-      DevKitMQTTClient_Event_AddProp(message, "HV", buf);
+        DevKitMQTTClient_Event_AddProp(message, "DID", clapDeviceId);
 
-      snprintf(buf, BUF_LEN, "%.2f", readPressure());
-      DevKitMQTTClient_Event_AddProp(message, "PV", buf);
+        snprintf(buf, BUF_LEN, "%.2f", curLevel);
+        DevKitMQTTClient_Event_AddProp(message, "SV", buf);
 
-      if (DevKitMQTTClient_SendEventInstance(message)) {
-        LogTrace("CLAP", "EventSent OK");
-      } else {
-        LogTrace("CLAP", "EventSend failed");
+        snprintf(buf, BUF_LEN, "%.2f", readTemperature());   
+        DevKitMQTTClient_Event_AddProp(message, "TV", buf);
+
+        snprintf(buf, BUF_LEN, "%.2f", readHumidity());
+        DevKitMQTTClient_Event_AddProp(message, "HV", buf);
+
+        snprintf(buf, BUF_LEN, "%.2f", readPressure());
+        DevKitMQTTClient_Event_AddProp(message, "PV", buf);
+
+        setState(CLAPMODE_UPLOADING);
+
+        if (DevKitMQTTClient_SendEventInstance(message)) {
+          LogTrace("CLAP", "EventSent OK");
+        } else {
+          LogTrace("CLAP", "EventSend failed");
+          messageSending = false;
+        } 
+
+        setState(CLAPMODE_NOP);
+        tick = millis();
+        
       }
-      
-      send_interval_ms = SystemTickCounterRead();
     }
-    else
-    {
-      DevKitMQTTClient_Check();
-    }
+
+    DevKitMQTTClient_Check();
   }
-  delay(10);
+  delay(50);
+
+  lastButtonAState = buttonAState;
+  lastButtonBState = buttonBState;
 }

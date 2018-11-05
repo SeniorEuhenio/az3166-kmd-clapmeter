@@ -8,8 +8,7 @@
 #include "config.h"
 #include "RGB_LED.h"
 #include "sensor.h"
-
-#define RGB_LED_BRIGHTNESS 32
+#include "utility.h"
 
 DevI2C *i2c;
 HTS221Sensor *sensor;
@@ -24,20 +23,26 @@ int getInterval()
     return interval;
 }
 
-void blinkLED()
+void ledOn(int red, int green, int blue) {
+    rgbLed.turnOff();
+    rgbLed.setColor(red, green, blue);
+}
+
+void ledOff() {
+    rgbLed.turnOff();
+}
+
+void blinkLED(int red, int green, int blue, int len)
 {
     rgbLed.turnOff();
-    rgbLed.setColor(RGB_LED_BRIGHTNESS, 0, 0);
-    delay(500);
+    rgbLed.setColor(red, green, blue);
+    delay(len);
     rgbLed.turnOff();
 }
 
 void blinkSendConfirmation()
 {
-    rgbLed.turnOff();
-    rgbLed.setColor(0, 0, RGB_LED_BRIGHTNESS);
-    delay(500);
-    rgbLed.turnOff();
+    blinkLED(0, 0, RGB_LED_BRIGHTNESS);
 }
 
 void parseTwinMessage(DEVICE_TWIN_UPDATE_STATE updateState, const char *message)
@@ -148,3 +153,25 @@ bool readMessage(int messageId, char *payload)
     json_value_free(root_value);
     return temperatureAlert;
 }
+
+float calcLoudness16LE(char *buf, uint16_t len) {
+    uint64_t sum = 0;
+    uint16_t samples = 0;
+    uint16_t idx = 0;
+    //len -= 0x44;
+    while (idx < len) {
+        int16_t partialValue = abs((int16_t)(buf[idx] + buf[idx + 1] << 8));
+        if (partialValue > 0) {     
+            sum += partialValue;
+            samples++;
+        }
+        idx += 4; // monochannel scan
+    }
+    if (samples > 0) {
+        float res = 20 * log10((sum/samples)/32767.0);
+        return isnan(res) ? -20.1 : res;
+    } else {
+        return -21.0;
+    }
+}
+
