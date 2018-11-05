@@ -13,10 +13,9 @@
 #include "SystemTickCounter.h"
 
 
-static bool hasWifi = false;
-int messageCount = 1;
-static bool messageSending = true;
-static uint64_t tick;
+bool hasWifi = false;
+bool allowComm = true;
+uint64_t tick;
 int lastButtonAState;
 int buttonAState;
 int lastButtonBState;
@@ -31,7 +30,7 @@ int buttonBState;
 const int AUDIO_LEN_MSECS = AUDIO_LEN_SECS * 1000;
 const int AUDIO_SIZE = AUDIO_LEN_SECS * (SAMPLE_RATE * BYTES_PER_SAMPLE) + WAVE_HEADER_LEN; // one sec more
 
-typedef enum {
+typedef enum ClapMode {
   CLAPMODE_NOP = 0,
   CLAPMODE_SAMPLING,
   CLAPMODE_CALCING,
@@ -43,10 +42,10 @@ char *audioBuffer;
 int audioInBuffer = 0;
 int clapState = CLAPMODE_NOP;
 
-char idler[] = { '|', '/', '-', '\\', '-'};
-byte idlerCounter = 0;
+bool allowRecord = false;
 
-float maxLevel = -22.0;
+float maxGain = -20.0;
+float maxRMS = 0;
 
 #define DEVICE_NAME "CLAP_0x"
 char clapDeviceId[16];
@@ -62,7 +61,7 @@ static void InitWifi()
     IPAddress ip = WiFi.localIP();
     Screen.print(1, ip.get_address());
     hasWifi = true;
-    Screen.print(2, "Running... \r\n");
+    Screen.print(2, "Booting... \r\n");
   }
   else
   {
@@ -107,12 +106,12 @@ static int  DeviceMethodCallback(const char *methodName, const unsigned char *pa
   if (strcmp(methodName, "start") == 0)
   {
     LogInfo("Start sending temperature and humidity data");
-    messageSending = true;
+    allowComm = true;
   }
   else if (strcmp(methodName, "stop") == 0)
   {
     LogInfo("Stop sending temperature and humidity data");
-    messageSending = false;
+    allowComm = false;
   }
   else
   {
@@ -135,7 +134,7 @@ void setState(int newState){
 
     switch (clapState) {
       case CLAPMODE_NOP:
-        snprintf(buf, 16, "%c Idling...", idler[idlerCounter++ % 5]);
+        snprintf(buf, 16, "> Idling...");
         ledOff();
         break;
       case CLAPMODE_SAMPLING:
@@ -143,7 +142,7 @@ void setState(int newState){
         snprintf(buf, 16, "> Sampling...");
         break;        
       case CLAPMODE_CALCING:
-        ledOn(RGB_LED_BRIGHTNESS, 0, RGB_LED_BRIGHTNESS);
+        ledOn(RGB_LED_BRIGHTNESS, RGB_LED_BRIGHTNESS, 0);
         snprintf(buf, 16, "> Calculating");
         break;
       case CLAPMODE_UPLOADING:
@@ -151,7 +150,7 @@ void setState(int newState){
         snprintf(buf, 16, "> Uploading...");
         break;
       default:
-        ledOn(RGB_LED_BRIGHTNESS, RGB_LED_BRIGHTNESS, 0);
+        ledOn(RGB_LED_BRIGHTNESS, 0, RGB_LED_BRIGHTNESS);
         snprintf(buf, 16, "X-(");
         break;
     }
@@ -205,6 +204,8 @@ void setup()
   pinMode(USER_BUTTON_B, INPUT);
   lastButtonBState = digitalRead(USER_BUTTON_B);
 
+  pauseResumeRecording(false);
+
   tick = millis();
 }
 
@@ -241,7 +242,104 @@ int record()
 }
 
 void resetLevel() {
-  maxLevel = -22.0;
+  maxGain = -20.0;
+  maxRMS = 0;
+}
+
+void processSoundMonitoring() {
+  setState(CLAPMODE_SAMPLING);
+  audioInBuffer = record();
+  setState(CLAPMODE_NOP);
+}
+
+void processSoundCalculations(float* gain, float* rms) {
+  setState(CLAPMODE_CALCING);
+
+  const byte BUF_LEN = 50;
+  char buf[BUF_LEN];
+
+  *gain = calcGain16LE(audioBuffer, audioInBuffer);
+  *rms = calcRMS16LE(audioBuffer, audioInBuffer);
+
+  audioInBuffer = 0;
+
+  maxGain = max(*gain, maxGain);
+  maxRMS = max(*rms, maxRMS);
+  snprintf(buf, BUF_LEN, "%.2fdB/%.0f", maxGain, maxRMS);
+  Screen.print(2, buf);
+}
+
+bool sendDeviceToCloudMessage(float gain, float rms) {
+  char messagePayload[MESSAGE_MAX_LEN];
+
+  EVENT_INSTANCE* message = DevKitMQTTClient_Event_Generate(messagePayload, MESSAGE);
+
+  DevKitMQTTClient_Event_AddProp(message, "DID", clapDeviceId);
+
+  const byte BUF_LEN = 50;
+  char buf[BUF_LEN];
+
+  snprintf(buf, BUF_LEN, "%.2f", gain);
+  DevKitMQTTClient_Event_AddProp(message, "SV", buf);
+
+  snprintf(buf, BUF_LEN, "%.2f", rms);
+  DevKitMQTTClient_Event_AddProp(message, "RMS", buf);
+
+  snprintf(buf, BUF_LEN, "%.2f", readTemperature());   
+  DevKitMQTTClient_Event_AddProp(message, "TV", buf);
+
+  snprintf(buf, BUF_LEN, "%.2f", readHumidity());
+  DevKitMQTTClient_Event_AddProp(message, "HV", buf);
+
+  snprintf(buf, BUF_LEN, "%.2f", readPressure());
+  DevKitMQTTClient_Event_AddProp(message, "PV", buf);
+
+    time_t t = time(NULL);
+    struct tm *tm_info = gmtime(&t);
+    char dts[26];
+    strftime(dts, 26, "%Y-%m-%d %H:%M:%S", tm_info);
+
+  DevKitMQTTClient_Event_AddProp(message, "DTS", dts);
+
+  setState(CLAPMODE_UPLOADING);
+
+  if (DevKitMQTTClient_SendEventInstance(message)) {
+    LogTrace("CLAP", "EventSent OK");
+    return true;
+  } else {
+    LogTrace("CLAP", "EventSend failed");
+    return false;
+  } 
+}
+
+void pauseResumeRecording(bool change) {
+  if (change) {
+    allowRecord = !allowRecord;
+  }
+
+  if (!allowRecord) {
+      Screen.print(2, ">> PAUSED <<");
+      Screen.print(3, "A=Meter B=Comm");
+  } else {
+      resetLevel();
+      Screen.print(2, "Levels Reset");
+      Screen.print(3, "(wait 3 secs)");
+      delay(3000);  
+    }
+}
+
+void pauseResumeUploading(bool change) {
+  if (change) {
+    allowComm = !allowComm;
+  }
+
+  if (allowComm) {
+    Screen.print(2, "Upload resumed");
+  } else {
+    Screen.print(2, "Upload suspended");
+  }
+  Screen.print(3, "(wait 1 sec)");
+  delay(1000);
 }
 
 void loop()
@@ -249,70 +347,44 @@ void loop()
   buttonAState = digitalRead(USER_BUTTON_A);
   buttonBState = digitalRead(USER_BUTTON_B);
 
-  if (buttonAState == LOW && lastButtonAState == HIGH
-    && buttonBState == LOW && lastButtonBState == HIGH) {
-      resetLevel();
-  }
-
-  setState(CLAPMODE_SAMPLING);
-  audioInBuffer = record();
-  setState(CLAPMODE_NOP);
-
-  if (hasWifi)
-  {
-    if (audioInBuffer) 
-    {
-        setState(CLAPMODE_CALCING);
-
-        const byte BUF_LEN = 50;
-        char buf[BUF_LEN];
-
-        float curLevel = -23.0;
-        curLevel = calcLoudness16LE(audioBuffer, audioInBuffer);
-        audioInBuffer = 0;
-
-        maxLevel = max(curLevel, maxLevel);
-        snprintf(buf, BUF_LEN, "dB=%.2f/%.2f", curLevel, maxLevel);
-        Screen.print(2, buf);
-
-      if (messageSending)
-      {
-        char messagePayload[MESSAGE_MAX_LEN];
-
-        EVENT_INSTANCE* message = DevKitMQTTClient_Event_Generate(messagePayload, MESSAGE);
-
-        DevKitMQTTClient_Event_AddProp(message, "DID", clapDeviceId);
-
-        snprintf(buf, BUF_LEN, "%.2f", curLevel);
-        DevKitMQTTClient_Event_AddProp(message, "SV", buf);
-
-        snprintf(buf, BUF_LEN, "%.2f", readTemperature());   
-        DevKitMQTTClient_Event_AddProp(message, "TV", buf);
-
-        snprintf(buf, BUF_LEN, "%.2f", readHumidity());
-        DevKitMQTTClient_Event_AddProp(message, "HV", buf);
-
-        snprintf(buf, BUF_LEN, "%.2f", readPressure());
-        DevKitMQTTClient_Event_AddProp(message, "PV", buf);
-
-        setState(CLAPMODE_UPLOADING);
-
-        if (DevKitMQTTClient_SendEventInstance(message)) {
-          LogTrace("CLAP", "EventSent OK");
-        } else {
-          LogTrace("CLAP", "EventSend failed");
-          messageSending = false;
-        } 
-
-        setState(CLAPMODE_NOP);
-        tick = millis();
-        
-      }
+  if (buttonBState == LOW && lastButtonBState == HIGH) {
+    pauseResumeUploading(true);
+  } else if (buttonAState == LOW && lastButtonAState == HIGH) {
+    pauseResumeRecording(true);
+  } 
+  else {
+    if (allowRecord) {
+      processSoundMonitoring();
+    } else {
+      pauseResumeRecording(false); // refresh screen
     }
 
-    DevKitMQTTClient_Check();
+    if (hasWifi)
+    {
+      if (audioInBuffer) 
+      {
+        float gain, rms;
+
+        processSoundCalculations(&gain, &rms);
+
+        if (allowComm)
+        {
+          if (!sendDeviceToCloudMessage(gain, rms)) {
+            Serial.println("ERR: Upload failed");
+          }
+
+          tick = millis();
+        }
+      }
+    }
+    setState(CLAPMODE_NOP);
   }
-  delay(50);
+
+  DevKitMQTTClient_Check();
+
+  if (!allowRecord && !allowComm) {
+    delay(50);
+  }
 
   lastButtonAState = buttonAState;
   lastButtonBState = buttonBState;

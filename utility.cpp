@@ -154,11 +154,11 @@ bool readMessage(int messageId, char *payload)
     return temperatureAlert;
 }
 
-float calcLoudness16LE(char *buf, uint16_t len) {
+float calcGain16LE(char *buf, uint16_t len) {
     uint64_t sum = 0;
     uint16_t samples = 0;
-    uint16_t idx = 0;
-    //len -= 0x44;
+    uint16_t idx = 0x44;
+    len -= 0x44;
     while (idx < len) {
         int16_t partialValue = abs((int16_t)(buf[idx] + buf[idx + 1] << 8));
         if (partialValue > 0) {     
@@ -172,6 +172,27 @@ float calcLoudness16LE(char *buf, uint16_t len) {
         return isnan(res) ? -20.1 : res;
     } else {
         return -21.0;
+    }
+}
+
+float calcRMS16LE(char *buf, uint16_t len) {
+    uint64_t sum = 0;
+    uint16_t samples = 0;
+    uint16_t idx = 0x44;
+    len -= 0x44;
+    while (idx < len) {
+        uint16_t partialValue = (uint64_t)abs((int16_t)(buf[idx] + buf[idx + 1] << 8));
+        if (partialValue > 0) {     
+            sum += partialValue * partialValue;
+            samples++;
+        }
+        idx += 4; // monochannel scan
+    }
+    if (samples > 0) {
+        float res = sqrt(sum/samples);
+        return isnan(res) ? 0.0 : res;
+    } else {
+        return 0.0;
     }
 }
 

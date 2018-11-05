@@ -19,7 +19,8 @@ float readPressure();
 float readTemperature();
 float readHumidity();
 
-float calcLoudness16LE(char *buf, uint16_t len);
+float calcGain16LE(char *buf, uint16_t len);
+float calcRMS16LE(char *buf, uint16_t len);
 void ledOn(int red, int green, int blue);
 void ledOff();
 
